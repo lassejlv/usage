@@ -4,10 +4,12 @@ struct PanelView: View {
     @ObservedObject var registry: ProviderRegistry
     @ObservedObject var settings: ProviderSettingsStore
     @State private var layout: PanelLayout = .usage
+    let onOpenAnalytics: () -> Void
 
-    init(registry: ProviderRegistry) {
+    init(registry: ProviderRegistry, onOpenAnalytics: @escaping () -> Void = {}) {
         self.registry = registry
         self.settings = registry.settings
+        self.onOpenAnalytics = onOpenAnalytics
     }
 
     var body: some View {
@@ -101,12 +103,23 @@ struct PanelView: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 10) {
             Text("Usage 0.1.0")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             Spacer()
+            Button(action: onOpenAnalytics) {
+                Image(systemName: "chart.bar.xaxis")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Open Analytics")
             Menu {
+                Button(action: onOpenAnalytics) {
+                    Label("Analytics", systemImage: "chart.bar.xaxis")
+                }
+
                 Button {
                     Task { await registry.refreshAll(force: true) }
                 } label: {

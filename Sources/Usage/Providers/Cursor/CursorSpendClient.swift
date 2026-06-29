@@ -83,7 +83,13 @@ struct CursorSpendClient: Sendable {
         }
 
         guard today != nil || last30Days != nil else { return nil }
-        return SpendSummary(today: today, last30Days: last30Days, estimated: true)
+
+        let daily = tokensByDay.keys.compactMap { key -> SpendSummary.Day? in
+            guard let date = ProviderHelpers.date(fromDayKey: key) else { return nil }
+            return SpendSummary.Day(date: date, tokens: tokensByDay[key] ?? 0, costUSD: costByDay[key])
+        }.sorted { $0.date < $1.date }
+
+        return SpendSummary(today: today, last30Days: last30Days, estimated: true, daily: daily)
     }
 
     private static func dayKey(from date: Date) -> String {

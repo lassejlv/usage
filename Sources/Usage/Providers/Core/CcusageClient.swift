@@ -269,7 +269,22 @@ final class CcusageClient: @unchecked Sendable {
         }
 
         guard today != nil || last30Days != nil else { return nil }
-        return SpendSummary(today: today, last30Days: last30Days, estimated: true)
+
+        // Per-day series for the analytics trend chart, aggregated by calendar day, oldest first.
+        var byDay: [String: (tokens: Int, cost: Double?)] = [:]
+        for day in days {
+            guard let key = normalizedDayKey(day.date) else { continue }
+            var entry = byDay[key] ?? (0, nil)
+            entry.tokens += day.tokens
+            if let cost = day.costUSD { entry.cost = (entry.cost ?? 0) + cost }
+            byDay[key] = entry
+        }
+        let daily = byDay.compactMap { key, value -> SpendSummary.Day? in
+            guard let date = ProviderHelpers.date(fromDayKey: key) else { return nil }
+            return SpendSummary.Day(date: date, tokens: value.tokens, costUSD: value.cost)
+        }.sorted { $0.date < $1.date }
+
+        return SpendSummary(today: today, last30Days: last30Days, estimated: true, daily: daily)
     }
 
     private static func hasUsage(_ entry: DailyUsage) -> Bool {

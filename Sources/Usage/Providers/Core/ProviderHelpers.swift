@@ -168,4 +168,13 @@ enum ProviderHelpers {
     static func clampPercent(_ value: Double) -> Double {
         min(max(value, 0), 100)
     }
+
+    /// Parse a `yyyy-MM-dd` day key to local midnight on that calendar day. Built via `Calendar.current`
+    /// so it round-trips with `dayKey(from:)` and lands on exactly the day Swift Charts buckets by
+    /// (`unit: .day`) — independent of the system time zone, and stable as an `Identifiable` id.
+    static func date(fromDayKey key: String) -> Date? {
+        let parts = key.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
+    }
 }

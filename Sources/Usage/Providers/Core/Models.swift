@@ -104,12 +104,22 @@ struct SpendSummary: Sendable, Hashable {
         var tokens: Int
     }
 
+    /// One calendar day's totals — the per-day series powering the analytics trend charts.
+    struct Day: Sendable, Hashable, Identifiable {
+        var date: Date
+        var tokens: Int
+        var costUSD: Double?
+        var id: Date { date }
+    }
+
     /// Today's usage, or nil when the source has nothing for today.
     var today: Period?
     /// Sum across the trailing 30 days, or nil when the whole window is idle.
     var last30Days: Period?
     /// True when dollars are a local estimate at API rates (the ccusage path), driving an "est." hint.
     var estimated: Bool
+    /// Per-day series across the queried window, oldest first. Empty when unavailable.
+    var daily: [Day] = []
 }
 
 /// The result of refreshing one provider: either live metrics or an error, plus metadata.

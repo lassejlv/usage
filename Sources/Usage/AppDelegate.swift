@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private var eventMonitor: Any?
     private var keyMonitor: Any?
+    private var analyticsWindowController: AnalyticsWindowController?
     private let registry = ProviderRegistry.makeDefault()
     private let paceNotifier = PaceNotifier()
     private var refreshTimer: Timer?
@@ -22,7 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 360, height: 460)
         popover.behavior = .transient
         popover.animates = true
-        popover.contentViewController = NSHostingController(rootView: PanelView(registry: registry))
+        popover.contentViewController = NSHostingController(
+            rootView: PanelView(registry: registry, onOpenAnalytics: { [weak self] in
+                self?.showAnalyticsWindow()
+            })
+        )
 
         // The status bar item (tray icon).
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -212,6 +217,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePopover() {
         popover.performClose(nil)
+    }
+
+    /// Open (or focus) the full analytics window. While it's open the app becomes `.regular` so it
+    /// gets a Dock icon and proper window focus; closing it returns to the menu-bar-only `.accessory`.
+    @MainActor
+    func showAnalyticsWindow() {
+        closePopover()
+        if analyticsWindowController == nil {
+            let controller = AnalyticsWindowController(registry: registry)
+            controller.onClose = { [weak self] in
+                self?.analyticsWindowController = nil
+                NSApp.setActivationPolicy(.accessory)
+            }
+            analyticsWindowController = controller
+        }
+        NSApp.setActivationPolicy(.regular)
+        analyticsWindowController?.showWindow(nil)
+        analyticsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func scheduleRefreshTimer() {
