@@ -9,15 +9,25 @@ actor CursorProvider: UsageProvider {
 
     private let authStore: CursorAuthStore
     private let client: CursorUsageClient
+    private let spendClient: CursorSpendClient
     private let now: @Sendable () -> Date
+
+    /// Last computed spend (today / 30-day cost + tokens), served immediately while a fresh value is
+    /// fetched in the background from the usage CSV export — so a refresh never blocks on it.
+    private var cachedSpend: SpendSummary?
+    private var spendUpdatedAt: Date?
+    private var spendInFlight = false
+    private static let spendTTL: TimeInterval = 90
 
     init(
         authStore: CursorAuthStore = CursorAuthStore(),
         client: CursorUsageClient = CursorUsageClient(),
+        spendClient: CursorSpendClient = CursorSpendClient(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.authStore = authStore
         self.client = client
+        self.spendClient = spendClient
         self.now = now
     }
 
@@ -40,6 +50,8 @@ actor CursorProvider: UsageProvider {
                 return .error(info, CursorAuthError.notLoggedIn.localizedDescription)
             }
 
+            refreshSpendIfNeeded(accessToken: accessToken)
+
             let usageResponse = try await client.fetchUsage(accessToken: accessToken)
             if usageResponse.statusCode == 401 || usageResponse.statusCode == 403 {
                 return .error(info, CursorAuthError.sessionExpired.localizedDescription)
@@ -52,10 +64,35 @@ actor CursorProvider: UsageProvider {
 
             let planName = await fetchPlanName(accessToken: accessToken)
             let credits = await fetchCredits(accessToken: accessToken)
-            return map(usage: usage, planName: planName, credits: credits)
+            return map(usage: usage, planName: planName, credits: credits).attaching(spend: cachedSpend)
         } catch {
             return .error(info, "Couldn't reach Cursor. Check your connection.")
         }
+    }
+
+    /// Kick off a background spend refresh (CSV export) when the cache is stale and none is in flight.
+    /// The result is cached on the actor and surfaces on the next refresh — never blocking this one.
+    private func refreshSpendIfNeeded(accessToken: String) {
+        if spendInFlight { return }
+        if let updatedAt = spendUpdatedAt, now().timeIntervalSince(updatedAt) < Self.spendTTL { return }
+        spendInFlight = true
+        Task {
+            let spend = await spendClient.spend(accessToken: accessToken, now: now())
+            applySpend(spend)
+        }
+    }
+
+    private func applySpend(_ spend: SpendSummary?) {
+        spendInFlight = false
+        // On failure (nil) leave spendUpdatedAt untouched so the next refresh retries.
+        guard let spend else { return }
+        spendUpdatedAt = now()
+        guard spend != cachedSpend else { return }
+        cachedSpend = spend
+        NotificationCenter.default.post(
+            name: .providerSpendDidUpdate, object: nil,
+            userInfo: [SpendUpdate.idKey: info.id, SpendUpdate.spendKey: spend]
+        )
     }
 
     private func refreshAccessToken(_ refreshToken: String) async throws -> String? {
@@ -102,6 +139,7 @@ actor CursorProvider: UsageProvider {
         appendCredits(credits, into: &metrics)
 
         let cycle = billingCycle(from: usage)
+        let cycleWindow: TimeInterval? = cycle.periodDurationMs > 0 ? Double(cycle.periodDurationMs) / 1000 : nil
         let totalSpend = number(planUsage["totalSpend"])
         let planLimit = number(planUsage["limit"])
         let planRemaining = number(planUsage["remaining"])
@@ -116,7 +154,8 @@ actor CursorProvider: UsageProvider {
                 label: "Total Usage",
                 used: normalizePercent(totalPercent),
                 limit: 100,
-                resetsAt: cycle.resetsAt
+                resetsAt: cycle.resetsAt,
+                windowDuration: cycleWindow
             ))
         }
 
@@ -125,7 +164,8 @@ actor CursorProvider: UsageProvider {
                 label: "Auto Usage",
                 used: normalizePercent(autoPercent),
                 limit: 100,
-                resetsAt: cycle.resetsAt
+                resetsAt: cycle.resetsAt,
+                windowDuration: cycleWindow
             ))
         }
 
@@ -134,7 +174,8 @@ actor CursorProvider: UsageProvider {
                 label: "API Usage",
                 used: normalizePercent(apiPercent),
                 limit: 100,
-                resetsAt: cycle.resetsAt
+                resetsAt: cycle.resetsAt,
+                windowDuration: cycleWindow
             ))
         }
 

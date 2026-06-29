@@ -9,19 +9,60 @@ actor CodexProvider: UsageProvider {
 
     private let authStore: CodexAuthStore
     private let client: CodexUsageClient
+    private let ccusage: CcusageClient
     private let now: @Sendable () -> Date
+
+    /// Last computed spend (today / 30-day cost + tokens), served immediately while a fresh value is
+    /// fetched in the background. ccusage spawns a subprocess, so we never block a refresh on it.
+    private var cachedSpend: SpendSummary?
+    private var spendUpdatedAt: Date?
+    private var spendInFlight = false
+    private static let spendTTL: TimeInterval = 90
 
     init(
         authStore: CodexAuthStore = CodexAuthStore(),
         client: CodexUsageClient = CodexUsageClient(),
+        ccusage: CcusageClient = CcusageClient(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.authStore = authStore
         self.client = client
+        self.ccusage = ccusage
         self.now = now
     }
 
     func refresh() async -> ProviderSnapshot {
+        refreshSpendIfNeeded()
+        return await fetchSnapshot().attaching(spend: cachedSpend)
+    }
+
+    /// Kick off a background spend refresh when the cache is stale and none is in flight. The result
+    /// is cached on the actor and surfaces on the next refresh — never blocking this one.
+    private func refreshSpendIfNeeded() {
+        if spendInFlight { return }
+        if let updatedAt = spendUpdatedAt, now().timeIntervalSince(updatedAt) < Self.spendTTL { return }
+        spendInFlight = true
+        Task {
+            let spend = await ccusage.spend(for: .codex, now: now())
+            applySpend(spend)
+        }
+    }
+
+    private func applySpend(_ spend: SpendSummary?) {
+        spendInFlight = false
+        // On failure (nil) leave spendUpdatedAt untouched so the next refresh retries, rather than
+        // suppressing it for the full TTL (a cold ccusage / unresolved PATH would otherwise stick).
+        guard let spend else { return }
+        spendUpdatedAt = now()
+        guard spend != cachedSpend else { return }
+        cachedSpend = spend
+        NotificationCenter.default.post(
+            name: .providerSpendDidUpdate, object: nil,
+            userInfo: [SpendUpdate.idKey: info.id, SpendUpdate.spendKey: spend]
+        )
+    }
+
+    private func fetchSnapshot() async -> ProviderSnapshot {
         guard let oauth = authStore.load(),
               oauth.accessToken?.isEmpty == false
         else {
@@ -56,8 +97,8 @@ actor CodexProvider: UsageProvider {
         var metrics: [UsageMetric] = []
 
         let rateLimit = body["rate_limit"] as? [String: Any]
-        appendWindow(rateLimit?["primary_window"], label: "Session", into: &metrics)
-        appendWindow(rateLimit?["secondary_window"], label: "Weekly", into: &metrics)
+        appendWindow(rateLimit?["primary_window"], label: "Session", fallbackWindow: 5 * 3600, into: &metrics)
+        appendWindow(rateLimit?["secondary_window"], label: "Weekly", fallbackWindow: 7 * 86400, into: &metrics)
 
         if metrics.isEmpty {
             if let used = number(response.header("x-codex-primary-used-percent")) {
@@ -65,7 +106,8 @@ actor CodexProvider: UsageProvider {
                     label: "Session",
                     used: normalizePercent(used),
                     limit: 100,
-                    resetsAt: resetDate(rateLimit?["primary_window"] as? [String: Any])
+                    resetsAt: resetDate(rateLimit?["primary_window"] as? [String: Any]),
+                    windowDuration: 5 * 3600
                 ))
             }
             if let used = number(response.header("x-codex-secondary-used-percent")) {
@@ -73,7 +115,8 @@ actor CodexProvider: UsageProvider {
                     label: "Weekly",
                     used: normalizePercent(used),
                     limit: 100,
-                    resetsAt: resetDate(rateLimit?["secondary_window"] as? [String: Any])
+                    resetsAt: resetDate(rateLimit?["secondary_window"] as? [String: Any]),
+                    windowDuration: 7 * 86400
                 ))
             }
         }
@@ -90,8 +133,11 @@ actor CodexProvider: UsageProvider {
         return metrics
     }
 
-    private nonisolated func appendWindow(_ value: Any?, label: String, into metrics: inout [UsageMetric]) {
+    private nonisolated func appendWindow(
+        _ value: Any?, label: String, fallbackWindow: TimeInterval, into metrics: inout [UsageMetric]
+    ) {
         guard let object = value as? [String: Any] else { return }
+        let window = windowDuration(object, fallback: fallbackWindow)
 
         if let percent = percentUsed(object) {
             metrics.append(UsageMetric(
@@ -99,7 +145,8 @@ actor CodexProvider: UsageProvider {
                 used: percent,
                 limit: 100,
                 kind: .percent,
-                resetsAt: resetDate(object)
+                resetsAt: resetDate(object),
+                windowDuration: window
             ))
             return
         }
@@ -121,8 +168,21 @@ actor CodexProvider: UsageProvider {
             used: used,
             limit: limit,
             kind: .percent,
-            resetsAt: resetDate(object)
+            resetsAt: resetDate(object),
+            windowDuration: window
         ))
+    }
+
+    /// The window's length, from the response when present (`window_minutes`/`window_seconds`), else
+    /// the conventional fallback (5h session / 7d weekly) — used to project the burn rate.
+    private nonisolated func windowDuration(_ object: [String: Any], fallback: TimeInterval) -> TimeInterval {
+        if let minutes = number(object["window_minutes"]) ?? number(object["limit_window_minutes"]), minutes > 0 {
+            return minutes * 60
+        }
+        if let seconds = number(object["window_seconds"]) ?? number(object["limit_window_seconds"]), seconds > 0 {
+            return seconds
+        }
+        return fallback
     }
 
     private nonisolated func percentUsed(_ object: [String: Any]) -> Double? {

@@ -12,7 +12,7 @@ struct PanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
+            topBar
             Divider().opacity(0.4)
 
             Group {
@@ -32,9 +32,25 @@ struct PanelView: View {
         .preferredColorScheme(settings.theme.colorScheme)
     }
 
+    @ViewBuilder
+    private var topBar: some View {
+        switch layout {
+        case .usage:
+            // The tab strip is the top bar in usage mode — Overview plus one tab per provider.
+            HStack(spacing: 0) {
+                ProviderTabBar(registry: registry)
+                if registry.isRefreshing {
+                    ProgressView().controlSize(.small).padding(.trailing, 12)
+                }
+            }
+        case .settings:
+            header
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
-            Text(layout == .usage ? "Usage" : "Settings")
+            Text("Settings")
                 .font(.system(size: 15, weight: .bold))
             Spacer()
             if registry.isRefreshing {
@@ -46,6 +62,14 @@ struct PanelView: View {
         .layoutPriority(1)
     }
 
+    /// Snapshots to show in the content area: just the selected provider, or all of them on Overview.
+    private var visibleCards: [ProviderSnapshot] {
+        if let id = registry.selectedProviderID {
+            return registry.snapshots.filter { $0.provider.id == id }
+        }
+        return registry.snapshots
+    }
+
     private var usageView: some View {
         Group {
             if registry.snapshots.isEmpty {
@@ -55,13 +79,18 @@ struct PanelView: View {
             } else {
                 ScrollView {
                     VStack(spacing: settings.density.cardSpacing) {
-                        ForEach(registry.snapshots) { snapshot in
+                        ForEach(visibleCards) { snapshot in
                             ProviderCard(
                                 snapshot: snapshot,
                                 valueFormat: settings.valueFormat,
                                 resetTimeFormat: settings.resetTimeFormat,
                                 timeDisplayFormat: settings.timeDisplayFormat,
-                                density: settings.density
+                                density: settings.density,
+                                isRefreshing: registry.isRefreshing
+                                    || registry.refreshingProviderIDs.contains(snapshot.provider.id),
+                                onRefresh: {
+                                    Task { await registry.refresh(providerID: snapshot.provider.id) }
+                                }
                             )
                         }
                     }
@@ -116,6 +145,83 @@ struct PanelView: View {
 private enum PanelLayout {
     case usage
     case settings
+}
+
+/// Horizontal, scrollable tab strip: an Overview tab followed by one tab per enabled provider.
+/// Selecting a tab filters the panel content and drives the menu-bar bar icon.
+private struct ProviderTabBar: View {
+    @ObservedObject var registry: ProviderRegistry
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                TabButton(
+                    title: "Overview",
+                    icon: .symbol("square.grid.2x2"),
+                    isSelected: registry.selectedProviderID == nil,
+                    isRefreshing: registry.isRefreshing
+                ) { registry.selectedProviderID = nil }
+
+                ForEach(registry.snapshots) { snapshot in
+                    TabButton(
+                        title: snapshot.provider.displayName,
+                        icon: .provider(snapshot.provider),
+                        isSelected: registry.selectedProviderID == snapshot.provider.id,
+                        isRefreshing: registry.isRefreshing
+                            || registry.refreshingProviderIDs.contains(snapshot.provider.id)
+                    ) { registry.selectedProviderID = snapshot.provider.id }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
+private struct TabButton: View {
+    enum IconSource {
+        case symbol(String)
+        case provider(ProviderInfo)
+    }
+
+    let title: String
+    let icon: IconSource
+    let isSelected: Bool
+    var isRefreshing: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                iconView
+                    .frame(height: 20)
+                // Reload-only skeleton; the slot is always reserved so the strip doesn't jump.
+                ZStack {
+                    if isRefreshing { SkeletonBar() }
+                }
+                .frame(width: 20, height: 3)
+            }
+            .frame(width: 38)
+            .padding(.vertical, 6)
+            .background(
+                isSelected ? Color.primary.opacity(0.08) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(title)
+    }
+
+    @ViewBuilder
+    private var iconView: some View {
+        switch icon {
+        case .symbol(let name):
+            Image(systemName: name).font(.system(size: 14, weight: .medium))
+        case .provider(let info):
+            ProviderIcon(info: info, size: 17)
+        }
+    }
 }
 
 private struct EmptyProvidersView: View {
@@ -229,6 +335,7 @@ private struct SettingsView: View {
                 appearanceSection
                 formatSection
                 refreshSection
+                notificationsSection
                 systemSection
                 providerSection
             }
@@ -330,6 +437,30 @@ private struct SettingsView: View {
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
     }
 
+    private var notificationsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Notifications")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Toggle("Know before you run out", isOn: $settings.notificationsEnabled)
+                .toggleStyle(.switch)
+
+            if settings.notificationsEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Almost out (under 10% left)", isOn: $settings.notifyAlmostOut)
+                    Toggle("Cutting it close", isOn: $settings.notifyCuttingClose)
+                    Toggle("Will run out before reset", isOn: $settings.notifyWillRunOut)
+                }
+                .font(.system(size: 13))
+                .padding(.leading, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
     private var systemSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("System")
@@ -411,6 +542,8 @@ private struct ProviderCard: View {
     let resetTimeFormat: ResetTimeFormat
     let timeDisplayFormat: TimeDisplayFormat
     let density: AppDensity
+    let isRefreshing: Bool
+    let onRefresh: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.cardInnerSpacing) {
@@ -424,9 +557,26 @@ private struct ProviderCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button(action: onRefresh) {
+                    if isRefreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(isRefreshing)
+                .help("Refresh \(snapshot.provider.displayName)")
             }
 
             content
+
+            if let spend = snapshot.spend {
+                Divider().opacity(0.4)
+                SpendView(spend: spend)
+            }
 
             // Staleness note below the metrics (only when there ARE metrics — the no-data case shows the
             // message as a badge inside `content`, so it isn't repeated here).
@@ -459,7 +609,8 @@ private struct ProviderCard: View {
                         resetTimeFormat: resetTimeFormat,
                         timeDisplayFormat: timeDisplayFormat,
                         density: density,
-                        accentHex: snapshot.provider.accentHex
+                        accentHex: snapshot.provider.accentHex,
+                        isRefreshing: isRefreshing
                     )
                 }
             } else if let note = snapshot.note {
@@ -491,6 +642,71 @@ private struct ProviderCard: View {
     }
 }
 
+/// The "Cost" block: collapsible Today / Last 30 days token + dollar spend. Collapsed by default — the
+/// header shows the 30-day total with a chevron; expanding reveals the per-period breakdown.
+private struct SpendView: View {
+    let spend: SpendSummary
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Text("Cost")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    if !expanded, let summary = collapsedSummary {
+                        Text(summary)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                if let today = spend.today {
+                    row("Today", period: today)
+                }
+                if let last30 = spend.last30Days {
+                    row("Last 30 days", period: last30)
+                }
+                if spend.estimated {
+                    Text("Estimated cost")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Shown on the collapsed header as an at-a-glance figure: the 30-day total, falling back to today.
+    private var collapsedSummary: String? {
+        if let last30 = spend.last30Days { return UsageFormat.spend(last30) }
+        if let today = spend.today { return UsageFormat.spend(today) }
+        return nil
+    }
+
+    private func row(_ label: String, period: SpendSummary.Period) -> some View {
+        HStack(spacing: 6) {
+            Text("\(label):")
+                .foregroundStyle(.secondary)
+            Text(UsageFormat.spend(period))
+            Spacer()
+        }
+        .font(.system(size: 13))
+    }
+}
+
 /// A labeled progress bar with "X% left" and "Resets in …".
 private struct MetricRow: View {
     let metric: UsageMetric
@@ -499,6 +715,7 @@ private struct MetricRow: View {
     let timeDisplayFormat: TimeDisplayFormat
     let density: AppDensity
     let accentHex: String?
+    let isRefreshing: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.metricSpacing) {
@@ -506,7 +723,8 @@ private struct MetricRow: View {
                 .font(.system(size: 14, weight: .semibold))
 
             ProgressBar(
-                fraction: remainingFraction, color: barColor, height: density.progressBarHeight)
+                fraction: remainingFraction, color: barColor, height: density.progressBarHeight,
+                isLoading: isRefreshing)
 
             HStack {
                 Text(UsageFormat.value(metric, format: valueFormat))
@@ -522,6 +740,40 @@ private struct MetricRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            if let pace = paceInfo {
+                HStack(spacing: 4) {
+                    Image(systemName: pace.icon).font(.system(size: 10, weight: .semibold))
+                    Text(pace.text).font(.system(size: 12))
+                }
+                .foregroundStyle(pace.color)
+            }
+        }
+    }
+
+    /// The "Know Before You Run Out" line: projects the burn rate to the end of the window. nil when
+    /// there's no signal (no window data, a credits meter, or too early in the window to project).
+    private var paceInfo: (text: String, color: Color, icon: String)? {
+        guard let resetsAt = metric.resetsAt, let window = metric.windowDuration else { return nil }
+        if case .credits = metric.kind { return nil }
+        guard let result = Pace.evaluate(
+            used: metric.used, limit: metric.limit, resetsAt: resetsAt, periodDuration: window
+        ) else {
+            return nil
+        }
+        switch result.status {
+        case .ahead:
+            return ("On track to last", .secondary, "checkmark.circle")
+        case .onTrack:
+            return ("Cutting it close", .yellow, "exclamationmark.triangle")
+        case .behind:
+            if let seconds = Pace.secondsToRunOut(
+                used: metric.used, limit: metric.limit, resetsAt: resetsAt, periodDuration: window
+            ) {
+                return ("On pace to run out in \(UsageFormat.shortDuration(seconds))", .red,
+                        "bolt.trianglebadge.exclamationmark")
+            }
+            return ("On pace to run out before reset", .red, "exclamationmark.triangle")
         }
     }
 
@@ -533,14 +785,7 @@ private struct MetricRow: View {
         return accentHex.flatMap(Color.init(hex:)) ?? .accentColor
     }
 
-    private var remainingFraction: Double {
-        switch metric.kind {
-        case .percent, .dollars, .count:
-            return 1 - metric.fraction
-        case .credits:
-            return metric.fraction
-        }
-    }
+    private var remainingFraction: Double { metric.remainingFraction }
 }
 
 extension Color {
@@ -560,16 +805,58 @@ private struct ProgressBar: View {
     let fraction: Double
     let color: Color
     let height: CGFloat
+    /// While reloading, the unfilled track shimmers — the colored fill stays on top, so only the
+    /// "space left" in the bar carries the skeleton effect.
+    var isLoading: Bool = false
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.12))
+                if isLoading {
+                    SkeletonBar()
+                } else {
+                    Capsule().fill(Color.primary.opacity(0.12))
+                }
                 Capsule()
                     .fill(color)
                     .frame(width: max(geo.size.width * fraction, fraction > 0 ? 4 : 0))
             }
         }
         .frame(height: height)
+    }
+}
+
+/// A skeleton capsule with a light band sweeping across it, used to fill a progress bar's empty track
+/// while data is reloading. Theme-aware (the band is a `primary` tint), so it reads in light and dark.
+private struct SkeletonBar: View {
+    @State private var animate = false
+
+    var body: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.12))
+            .overlay(
+                GeometryReader { geo in
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .clear, location: 0),
+                                    .init(color: Color.primary.opacity(0.22), location: 0.5),
+                                    .init(color: .clear, location: 1),
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: geo.size.width * 0.5)
+                        .offset(x: animate ? geo.size.width * 1.1 : -geo.size.width * 0.6)
+                }
+            )
+            .clipShape(Capsule())
+            .onAppear {
+                withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
+                    animate = true
+                }
+            }
     }
 }

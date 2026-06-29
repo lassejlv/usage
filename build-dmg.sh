@@ -65,6 +65,11 @@ for bundle in "${BIN_DIR}"/*.bundle; do
     cp -R "${bundle}" "${RESOURCES_DIR}/"
 done
 
+# App icon (the Dock/Finder icon, distinct from the menu bar tray glyph).
+if [ -f "${SCRIPT_DIR}/icon/Usage.icns" ]; then
+    cp "${SCRIPT_DIR}/icon/Usage.icns" "${RESOURCES_DIR}/Usage.icns"
+fi
+
 log_step "Writing Info.plist..."
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -81,6 +86,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>${APP_DISPLAY_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>Usage</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

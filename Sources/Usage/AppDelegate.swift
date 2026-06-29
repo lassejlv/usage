@@ -8,7 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private var eventMonitor: Any?
+    private var keyMonitor: Any?
     private let registry = ProviderRegistry.makeDefault()
+    private let paceNotifier = PaceNotifier()
     private var refreshTimer: Timer?
     private var cancellables: Set<AnyCancellable> = []
 
@@ -38,6 +40,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.closePopover()
         }
 
+        // Keyboard shortcuts active only while the popover is the key surface (the app is a menu-bar
+        // accessory with no menu, so we handle them ourselves). ⌘Q quits, ⌘R refreshes everything.
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            self?.handleKeyDown(event) ?? event
+        }
+
         // Initial fetch (forced past the throttle), then refresh on a timer so the bars stay current.
         Task { await registry.refreshAll(force: true) }
         scheduleRefreshTimer()
@@ -60,15 +68,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
         registry.$snapshots
             .dropFirst()
-            .sink { [weak self] snapshots in self?.updateStatusItemIcon(snapshots: snapshots) }
+            .sink { [weak self] snapshots in
+                guard let self else { return }
+                self.updateStatusItemIcon(snapshots: snapshots)
+                self.paceNotifier.evaluate(snapshots: snapshots, settings: self.registry.settings)
+            }
+            .store(in: &cancellables)
+        paceNotifier.configure(enabled: registry.settings.notificationsEnabled)
+        registry.settings.$notificationsEnabled
+            .dropFirst()
+            .sink { [weak self] enabled in self?.paceNotifier.setEnabled(enabled) }
+            .store(in: &cancellables)
+        registry.$selectedProviderID
+            .dropFirst()
+            .sink { [weak self] id in self?.updateStatusItemIcon(selectedID: id) }
             .store(in: &cancellables)
     }
 
-    private func updateStatusItemIcon(snapshots: [ProviderSnapshot]? = nil) {
+    /// `selectedID` is a double optional so the publisher can hand us the just-committed value:
+    /// `.some(value)` uses `value` (a `nil` inside means Overview), while `.none` falls back to the
+    /// live property. @Published fires during `willSet`, so re-reading the property in the
+    /// `$selectedProviderID` sink would see the *old* selection — hence we pass the new value through.
+    private func updateStatusItemIcon(snapshots: [ProviderSnapshot]? = nil, selectedID: String?? = .none) {
         guard let button = statusItem.button else { return }
         switch registry.settings.iconStyle {
         case .bars:
-            button.image = makeBarsStatusImage(snapshots: snapshots ?? registry.snapshots)
+            let resolvedSelection = selectedID ?? registry.selectedProviderID
+            button.image = makeBarsStatusImage(
+                snapshots: snapshots ?? registry.snapshots, selectedID: resolvedSelection)
             button.image?.isTemplate = true
         case .gauge, .percent:
             button.image = NSImage(
@@ -80,8 +107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.needsDisplay = true
     }
 
-    private func makeBarsStatusImage(snapshots: [ProviderSnapshot]) -> NSImage {
-        let metrics = statusBarMetrics(snapshots: snapshots)
+    private func makeBarsStatusImage(snapshots: [ProviderSnapshot], selectedID: String?) -> NSImage {
+        let metrics = statusBarMetrics(snapshots: snapshots, selectedID: selectedID)
         let size = NSSize(width: 22, height: 18)
         let image = NSImage(size: size)
         image.lockFocus()
@@ -116,29 +143,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    private func statusBarMetrics(snapshots: [ProviderSnapshot]) -> [Double] {
-        let preferredLabels = ["Weekly", "Session"]
-        // The first two providers, each contributing its two headline metrics — four bars when both
-        // exist, two when only one provider is enabled.
-        let chosen = Array(snapshots.prefix(2))
-        guard !chosen.isEmpty else { return [0.18, 0.18, 0.18, 0.18] }
-
-        var fractions: [Double] = []
-        for snapshot in chosen {
-            let preferredMetrics = preferredLabels.compactMap { label in
-                snapshot.metrics.first { $0.label.localizedCaseInsensitiveContains(label) }
-            }
-            let metrics =
-                preferredMetrics.isEmpty ? Array(snapshot.metrics.prefix(2)) : preferredMetrics
-            var pair = metrics.map(\.fraction)
-            if pair.isEmpty {
-                pair = [0.18, 0.18]
-            } else if pair.count == 1 {
-                pair = [pair[0], pair[0]]
-            }
-            fractions.append(contentsOf: pair.prefix(2))
+    private func statusBarMetrics(snapshots: [ProviderSnapshot], selectedID: String?) -> [Double] {
+        // A selected provider tab drives the icon directly (two bars for its headline metrics).
+        // The Overview tab always shows four bars — the first two providers' headline pairs.
+        if let id = selectedID,
+           let snapshot = snapshots.first(where: { $0.provider.id == id }) {
+            return headlineFractions(snapshot)
         }
-        return fractions
+
+        let fractions = snapshots.prefix(2).flatMap(headlineFractions)
+        // Pad with placeholders when fewer than two providers are present so Overview stays four bars.
+        return Array((fractions + [0.18, 0.18, 0.18, 0.18]).prefix(4))
+    }
+
+    /// A provider's two headline bars for the tray icon, mirroring its card: the "Session"/"Weekly"
+    /// meters in their natural card order (else the first two metrics), as REMAINING fractions so a
+    /// fuller bar means more left — matching the card and tab visuals (drawn top-to-bottom, index 0 on
+    /// top, so Session sits above Weekly just like the card rows). Padded to two for a consistent pair.
+    private func headlineFractions(_ snapshot: ProviderSnapshot) -> [Double] {
+        let headlineLabels = ["Session", "Weekly"]
+        let headline = snapshot.metrics.filter { metric in
+            headlineLabels.contains { metric.label.localizedCaseInsensitiveContains($0) }
+        }
+        let metrics = headline.isEmpty ? Array(snapshot.metrics.prefix(2)) : headline
+        var pair = Array(metrics.prefix(2)).map(\.remainingFraction)
+        if pair.isEmpty {
+            pair = [0.18, 0.18]
+        } else if pair.count == 1 {
+            pair = [pair[0], pair[0]]
+        }
+        return pair
+    }
+
+    /// Handle ⌘Q / ⌘R, but only while the popover is shown — otherwise pass the event through so we
+    /// never swallow shortcuts meant for whatever app is frontmost.
+    private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        guard popover.isShown, event.modifierFlags.contains(.command) else { return event }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "q":
+            NSApp.terminate(nil)
+            return nil
+        case "r":
+            Task { await registry.refreshAll(force: true) }
+            return nil
+        default:
+            return event
+        }
     }
 
     @objc private func togglePopover(_ sender: Any?) {

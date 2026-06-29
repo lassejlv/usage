@@ -48,6 +48,15 @@ struct ClaudeAuthStore: Sendable {
         return loadFromKeychain() ?? loadFromFile()
     }
 
+    /// The usage endpoint requires the `user:profile` scope. A credential minted for inference only
+    /// (e.g. `claude setup-token`, or an inference-scoped login) 403s on `/api/oauth/usage`, so we
+    /// detect that and skip the call rather than surfacing a confusing error. Unknown scopes (nil/empty
+    /// — e.g. a bare env token) are given the benefit of the doubt and still attempted.
+    func canFetchLiveUsage(_ oauth: ClaudeOAuth) -> Bool {
+        guard let scopes = oauth.scopes, !scopes.isEmpty else { return true }
+        return scopes.contains("user:profile")
+    }
+
     /// True when the access token is missing or within 5 minutes of expiry — refresh before using it.
     func needsRefresh(_ oauth: ClaudeOAuth, now: Date) -> Bool {
         guard let expiresAt = oauth.expiresAt else { return false }

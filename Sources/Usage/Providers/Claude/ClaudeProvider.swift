@@ -11,7 +11,15 @@ actor ClaudeProvider: UsageProvider {
 
     private let authStore: ClaudeAuthStore
     private let client: ClaudeUsageClient
+    private let ccusage: CcusageClient
     private let now: @Sendable () -> Date
+
+    /// Last computed spend (today / 30-day cost + tokens), served immediately while a fresh value is
+    /// fetched in the background. ccusage spawns a subprocess, so we never block a refresh on it.
+    private var cachedSpend: SpendSummary?
+    private var spendUpdatedAt: Date?
+    private var spendInFlight = false
+    private static let spendTTL: TimeInterval = 90
 
     /// Last clean usage, served during a rate-limit window so the card never blanks. Only ever holds a
     /// successful mapping (never a rate-limited snapshot), so the staleness note is never baked in.
@@ -26,18 +34,61 @@ actor ClaudeProvider: UsageProvider {
     init(
         authStore: ClaudeAuthStore = ClaudeAuthStore(),
         client: ClaudeUsageClient = ClaudeUsageClient(),
+        ccusage: CcusageClient = CcusageClient(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.authStore = authStore
         self.client = client
+        self.ccusage = ccusage
         self.now = now
     }
 
     func refresh() async -> ProviderSnapshot {
+        refreshSpendIfNeeded()
+        return await fetchSnapshot().attaching(spend: cachedSpend)
+    }
+
+    /// Kick off a background spend refresh when the cache is stale and none is in flight. The result
+    /// is cached on the actor and surfaces on the next refresh — never blocking this one.
+    private func refreshSpendIfNeeded() {
+        if spendInFlight { return }
+        if let updatedAt = spendUpdatedAt, now().timeIntervalSince(updatedAt) < Self.spendTTL { return }
+        spendInFlight = true
+        Task {
+            let spend = await ccusage.spend(for: .claude, now: now())
+            applySpend(spend)
+        }
+    }
+
+    private func applySpend(_ spend: SpendSummary?) {
+        spendInFlight = false
+        // On failure (nil) leave spendUpdatedAt untouched so the next refresh retries, rather than
+        // suppressing it for the full TTL (a cold ccusage / unresolved PATH would otherwise stick).
+        guard let spend else { return }
+        spendUpdatedAt = now()
+        guard spend != cachedSpend else { return }
+        cachedSpend = spend
+        NotificationCenter.default.post(
+            name: .providerSpendDidUpdate, object: nil,
+            userInfo: [SpendUpdate.idKey: info.id, SpendUpdate.spendKey: spend]
+        )
+    }
+
+    private func fetchSnapshot() async -> ProviderSnapshot {
         guard var oauth = authStore.load(),
               oauth.accessToken?.isEmpty == false
         else {
             return .error(info, ClaudeAuthError.notLoggedIn.localizedDescription)
+        }
+
+        // A credential without the `user:profile` scope (an inference-only login) will 403 on the usage
+        // endpoint. Detect it and surface an actionable note instead of hammering the endpoint — the
+        // Cost block (from local logs) still attaches, so the card stays useful.
+        guard authStore.canFetchLiveUsage(oauth) else {
+            return .error(
+                info,
+                "Logged in for inference only — re-login with Claude Code to show live usage."
+            )
         }
 
         // Inside an active cooldown, skip the network entirely and serve last-good (or a calm badge).
@@ -140,9 +191,9 @@ actor ClaudeProvider: UsageProvider {
         }
 
         var metrics: [UsageMetric] = []
-        appendWindow(body["five_hour"], label: "Session", into: &metrics)
-        appendWindow(body["seven_day"], label: "Weekly", into: &metrics)
-        appendWindow(body["seven_day_sonnet"], label: "Sonnet", into: &metrics)
+        appendWindow(body["five_hour"], label: "Session", windowDuration: 5 * 3600, into: &metrics)
+        appendWindow(body["seven_day"], label: "Weekly", windowDuration: 7 * 86400, into: &metrics)
+        appendWindow(body["seven_day_sonnet"], label: "Sonnet", windowDuration: 7 * 86400, into: &metrics)
         appendExtraUsage(body["extra_usage"], into: &metrics)
 
         // Cache only clean successes; the cooldown path never writes here.
@@ -152,7 +203,9 @@ actor ClaudeProvider: UsageProvider {
         return .ok(info, plan: lastGoodPlan, metrics: metrics, at: now())
     }
 
-    private func appendWindow(_ value: Any?, label: String, into metrics: inout [UsageMetric]) {
+    private func appendWindow(
+        _ value: Any?, label: String, windowDuration: TimeInterval, into metrics: inout [UsageMetric]
+    ) {
         guard let object = value as? [String: Any],
               let utilization = number(object["utilization"])
         else {
@@ -163,7 +216,8 @@ actor ClaudeProvider: UsageProvider {
             used: utilization,
             limit: 100,
             kind: .percent,
-            resetsAt: date(object["resets_at"])
+            resetsAt: date(object["resets_at"]),
+            windowDuration: windowDuration
         ))
     }
 

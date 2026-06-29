@@ -7,6 +7,12 @@ import Combine
 final class ProviderRegistry: ObservableObject {
     @Published private(set) var snapshots: [ProviderSnapshot]
     @Published private(set) var isRefreshing = false
+    /// Providers with an in-flight single-card refresh (the per-card refresh button), so just that
+    /// card/tab shimmers rather than the whole panel.
+    @Published private(set) var refreshingProviderIDs: Set<String> = []
+    /// The active panel tab. `nil` is the Overview tab (all providers); otherwise a provider id.
+    /// Observed by both the panel (to filter content) and the AppDelegate (to drive the tray icon).
+    @Published var selectedProviderID: String?
     let settings: ProviderSettingsStore
 
     private let providers: [any UsageProvider]
@@ -14,6 +20,7 @@ final class ProviderRegistry: ObservableObject {
     private let providerInfoByID: [String: ProviderInfo]
     private var snapshotByID: [String: ProviderSnapshot]
     private var settingsCancellable: AnyCancellable?
+    private var spendObserver: NSObjectProtocol?
     /// When the last refresh *completed* (success or failure). nil until the first one finishes.
     private(set) var lastRefreshAt: Date?
     /// Minimum spacing between *automatic* refreshes. Forced refreshes (launch, manual button) bypass it.
@@ -29,8 +36,29 @@ final class ProviderRegistry: ObservableObject {
         self.snapshots = visibleSnapshots()
         self.settingsCancellable = settings.objectWillChange.sink { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.snapshots = self?.visibleSnapshots() ?? []
-                self?.objectWillChange.send()
+                guard let self else { return }
+                // Drop back to Overview if the selected provider was just disabled or removed.
+                if let id = self.selectedProviderID, !self.settings.enabledProviderIDs.contains(id) {
+                    self.selectedProviderID = nil
+                }
+                self.snapshots = self.visibleSnapshots()
+                self.objectWillChange.send()
+            }
+        }
+        // A provider's background spend fetch lands after its refresh, so patch the cached snapshot in
+        // place when it arrives rather than waiting for the next refresh tick.
+        self.spendObserver = NotificationCenter.default.addObserver(
+            forName: .providerSpendDidUpdate, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let id = note.userInfo?[SpendUpdate.idKey] as? String,
+                  let spend = note.userInfo?[SpendUpdate.spendKey] as? SpendSummary
+            else {
+                return
+            }
+            MainActor.assumeIsolated {
+                guard let self, let snapshot = self.snapshotByID[id] else { return }
+                self.snapshotByID[id] = snapshot.attaching(spend: spend)
+                self.snapshots = self.visibleSnapshots()
             }
         }
     }
@@ -72,6 +100,17 @@ final class ProviderRegistry: ObservableObject {
         for (id, snapshot) in results {
             snapshotByID[id] = snapshot
         }
+        snapshots = visibleSnapshots()
+        lastRefreshAt = Date()
+    }
+
+    /// Refresh a single provider on demand (the per-card refresh button), bypassing the auto throttle.
+    func refresh(providerID id: String) async {
+        guard let provider = providerByID[id] else { return }
+        refreshingProviderIDs.insert(id)
+        defer { refreshingProviderIDs.remove(id) }
+        let snapshot = await provider.refresh()
+        snapshotByID[id] = snapshot
         snapshots = visibleSnapshots()
         lastRefreshAt = Date()
     }

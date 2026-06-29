@@ -176,6 +176,18 @@ final class ProviderSettingsStore: ObservableObject {
     @Published var timeDisplayFormat: TimeDisplayFormat {
         didSet { saveTimeDisplayFormat() }
     }
+    @Published var notificationsEnabled: Bool {
+        didSet { defaults.set(notificationsEnabled, forKey: notificationsEnabledKey) }
+    }
+    @Published var notifyAlmostOut: Bool {
+        didSet { defaults.set(notifyAlmostOut, forKey: notifyAlmostOutKey) }
+    }
+    @Published var notifyCuttingClose: Bool {
+        didSet { defaults.set(notifyCuttingClose, forKey: notifyCuttingCloseKey) }
+    }
+    @Published var notifyWillRunOut: Bool {
+        didSet { defaults.set(notifyWillRunOut, forKey: notifyWillRunOutKey) }
+    }
 
     private let defaults: UserDefaults
     private let providerPreferenceKey = "providerPreferences.v2"
@@ -188,6 +200,10 @@ final class ProviderSettingsStore: ObservableObject {
     private let themeKey = "theme.v1"
     private let densityKey = "density.v1"
     private let timeDisplayFormatKey = "timeDisplayFormat.v1"
+    private let notificationsEnabledKey = "notificationsEnabled.v1"
+    private let notifyAlmostOutKey = "notifyAlmostOut.v1"
+    private let notifyCuttingCloseKey = "notifyCuttingClose.v1"
+    private let notifyWillRunOutKey = "notifyWillRunOut.v1"
 
     init(providerIDs: [String], defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -261,6 +277,13 @@ final class ProviderSettingsStore: ObservableObject {
         } else {
             self.timeDisplayFormat = .twentyFourHour
         }
+
+        // Notifications: master is opt-in (off by default); the per-milestone toggles default on so
+        // enabling the master immediately alerts on all three milestones.
+        self.notificationsEnabled = defaults.bool(forKey: notificationsEnabledKey)
+        self.notifyAlmostOut = defaults.object(forKey: notifyAlmostOutKey) as? Bool ?? true
+        self.notifyCuttingClose = defaults.object(forKey: notifyCuttingCloseKey) as? Bool ?? true
+        self.notifyWillRunOut = defaults.object(forKey: notifyWillRunOutKey) as? Bool ?? true
     }
 
     func isEnabled(_ id: String) -> Bool {
