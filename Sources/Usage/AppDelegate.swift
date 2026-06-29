@@ -183,8 +183,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Handle ⌘Q / ⌘R, but only while the popover is shown — otherwise pass the event through so we
     /// never swallow shortcuts meant for whatever app is frontmost.
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
-        guard popover.isShown, event.modifierFlags.contains(.command) else { return event }
-        switch event.charactersIgnoringModifiers?.lowercased() {
+        guard event.modifierFlags.contains(.command) else { return event }
+        let key = event.charactersIgnoringModifiers?.lowercased()
+
+        // ⌘W closes the analytics window when it's the focused window.
+        if key == "w", let window = analyticsWindowController?.window, window.isKeyWindow {
+            window.performClose(nil)
+            return nil
+        }
+
+        // The rest act only while one of our surfaces is active (the popover or the analytics window).
+        let active = popover.isShown || (analyticsWindowController?.window?.isKeyWindow ?? false)
+        guard active else { return event }
+        switch key {
         case "q":
             NSApp.terminate(nil)
             return nil

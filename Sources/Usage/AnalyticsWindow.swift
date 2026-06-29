@@ -1,5 +1,6 @@
 import AppKit
 import Charts
+import Combine
 import SwiftUI
 
 /// Hosts the full analytics window — a standalone, resizable window with a sidebar, distinct from the
@@ -8,6 +9,7 @@ import SwiftUI
 @MainActor
 final class AnalyticsWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
+    private var themeCancellable: AnyCancellable?
 
     init(registry: ProviderRegistry) {
         let hosting = NSHostingController(rootView: AnalyticsView(registry: registry))
@@ -18,6 +20,12 @@ final class AnalyticsWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         super.init(window: window)
         window.delegate = self
+        // Keep the window chrome (behind the translucent sidebar/detail) in sync with the named theme's
+        // background — including theme changes made while the window is open. `$theme` replays the
+        // current value on subscribe, so this also sets the initial color.
+        themeCancellable = registry.settings.$theme.sink { [weak window] theme in
+            window?.backgroundColor = theme.background.map(NSColor.init) ?? .windowBackgroundColor
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -59,6 +67,7 @@ struct AnalyticsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 760, minHeight: 500)
+        .tint(registry.settings.theme.accent)
         .preferredColorScheme(registry.settings.theme.colorScheme)
     }
 

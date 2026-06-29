@@ -89,9 +89,20 @@ enum AppIconStyle: String, CaseIterable, Identifiable, Codable {
 }
 
 enum AppTheme: String, CaseIterable, Identifiable, Codable {
+    // Native modes (no palette override — keep the system chrome).
     case system
     case light
     case dark
+    // Named color themes (custom background + accent).
+    case tokyoNight
+    case catppuccin
+    case dracula
+    case nord
+    case gruvbox
+    case oneDark
+    case rosePine
+    case solarized
+    case monokai
 
     var id: String { rawValue }
 
@@ -100,6 +111,15 @@ enum AppTheme: String, CaseIterable, Identifiable, Codable {
         case .system: "System"
         case .light: "Light"
         case .dark: "Dark"
+        case .tokyoNight: "Tokyo Night"
+        case .catppuccin: "Catppuccin Mocha"
+        case .dracula: "Dracula"
+        case .nord: "Nord"
+        case .gruvbox: "Gruvbox"
+        case .oneDark: "One Dark"
+        case .rosePine: "Rosé Pine"
+        case .solarized: "Solarized Dark"
+        case .monokai: "Monokai"
         }
     }
 }
@@ -301,6 +321,17 @@ final class ProviderSettingsStore: ObservableObject {
         guard from != to else { return }
         let item = providerPreferences.remove(at: from)
         providerPreferences.insert(item, at: to)
+    }
+
+    /// Move `id` into the slot currently held by `targetID` (drag-to-reorder).
+    func moveProvider(_ id: String, toRowOf targetID: String) {
+        guard id != targetID,
+              let from = providerPreferences.firstIndex(where: { $0.id == id }),
+              let to = providerPreferences.firstIndex(where: { $0.id == targetID })
+        else {
+            return
+        }
+        providerPreferences.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
     }
 
     var enabledProviderIDs: [String] {

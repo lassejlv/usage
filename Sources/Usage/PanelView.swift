@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PanelView: View {
     @ObservedObject var registry: ProviderRegistry
@@ -31,6 +32,8 @@ struct PanelView: View {
             footer
         }
         .frame(width: 360, height: 460)
+        .background(settings.theme.background ?? Color.clear)
+        .tint(settings.theme.accent)
         .preferredColorScheme(settings.theme.colorScheme)
     }
 
@@ -336,6 +339,7 @@ private struct EmptyProvidersView: View {
 private struct SettingsView: View {
     @ObservedObject var registry: ProviderRegistry
     @ObservedObject var settings: ProviderSettingsStore
+    @State private var draggingProviderID: String?
 
     init(registry: ProviderRegistry) {
         self.registry = registry
@@ -494,22 +498,27 @@ private struct SettingsView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.secondary)
 
-            VStack(spacing: 8) {
-                ForEach(Array(registry.orderedProviderInfos.enumerated()), id: \.element.id) {
-                    index, info in
+            // Rows tile contiguously (vertical padding, not VStack spacing) so the catch-all reset
+            // delegate below only fires `dropExited` when the cursor leaves the whole list — not when
+            // crossing between rows — which would otherwise clear the drag state mid-reorder.
+            VStack(spacing: 0) {
+                ForEach(registry.orderedProviderInfos) { info in
                     ProviderSettingsRow(
                         info: info,
                         isEnabled: Binding(
                             get: { registry.settings.isEnabled(info.id) },
                             set: { settings.setEnabled(info.id, $0) }
                         ),
-                        moveUp: { settings.moveProvider(info.id, by: -1) },
-                        moveDown: { settings.moveProvider(info.id, by: 1) },
-                        canMoveUp: index > 0,
-                        canMoveDown: index < registry.orderedProviderInfos.count - 1
+                        draggingID: $draggingProviderID,
+                        onMove: { dragged, target in settings.moveProvider(dragged, toRowOf: target) }
                     )
                 }
             }
+            // Clears the drag state when a drag is released/cancelled outside any row, so the dragged
+            // row never stays dimmed.
+            .onDrop(of: [.text], delegate: ProviderReorderResetDelegate(draggingID: $draggingProviderID))
+            .animation(.spring(response: 0.28, dampingFraction: 0.86),
+                       value: registry.orderedProviderInfos.map(\.id))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
@@ -520,31 +529,77 @@ private struct SettingsView: View {
 private struct ProviderSettingsRow: View {
     let info: ProviderInfo
     @Binding var isEnabled: Bool
-    let moveUp: () -> Void
-    let moveDown: () -> Void
-    let canMoveUp: Bool
-    let canMoveDown: Bool
+    @Binding var draggingID: String?
+    let onMove: (_ dragged: String, _ target: String) -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            ProviderIcon(info: info, size: 16)
-            Text(info.displayName)
-                .font(.system(size: 13, weight: .medium))
-            Spacer()
-            Button(action: moveUp) {
-                Image(systemName: "chevron.up")
+            // The icon + name + grip is the drag source; the toggle stays independently tappable.
+            HStack(spacing: 8) {
+                ProviderIcon(info: info, size: 16)
+                Text(info.displayName)
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(.borderless)
-            .disabled(!canMoveUp)
-            Button(action: moveDown) {
-                Image(systemName: "chevron.down")
+            .contentShape(Rectangle())
+            .onDrag {
+                draggingID = info.id
+                return NSItemProvider(object: info.id as NSString)
             }
-            .buttonStyle(.borderless)
-            .disabled(!canMoveDown)
+
             Toggle("", isOn: $isEnabled)
                 .labelsHidden()
         }
-        .frame(minHeight: 28)
+        .frame(minHeight: 24)
+        .padding(.vertical, 5)
+        .contentShape(Rectangle())
+        .opacity(draggingID == info.id ? 0.4 : 1)
+        .onDrop(of: [.text], delegate: ProviderReorderDropDelegate(
+            targetID: info.id, draggingID: $draggingID, onMove: onMove))
+    }
+}
+
+/// Live drag-to-reorder: while a row is dragged over another, the dragged provider takes that row's
+/// slot. Reordering happens on `dropEntered` so the list rearranges under the cursor.
+private struct ProviderReorderDropDelegate: DropDelegate {
+    let targetID: String
+    @Binding var draggingID: String?
+    let onMove: (_ dragged: String, _ target: String) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging = draggingID, dragging != targetID else { return }
+        onMove(dragging, targetID)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingID = nil
+        return true
+    }
+}
+
+/// Catch-all on the whole list: clears the drag state when a drag ends outside any row (released in the
+/// surrounding padding, or dragged out of the list and dropped/cancelled), so no row stays dimmed.
+private struct ProviderReorderResetDelegate: DropDelegate {
+    @Binding var draggingID: String?
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        draggingID = nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingID = nil
+        return true
     }
 }
 
