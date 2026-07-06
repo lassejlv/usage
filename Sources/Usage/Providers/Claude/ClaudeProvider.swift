@@ -194,6 +194,7 @@ actor ClaudeProvider: UsageProvider {
         appendWindow(body["five_hour"], label: "Session", windowDuration: 5 * 3600, into: &metrics)
         appendWindow(body["seven_day"], label: "Weekly", windowDuration: 7 * 86400, into: &metrics)
         appendWindow(body["seven_day_sonnet"], label: "Sonnet", windowDuration: 7 * 86400, into: &metrics)
+        appendScopedLimits(body["limits"], into: &metrics)
         appendExtraUsage(body["extra_usage"], into: &metrics)
 
         // Cache only clean successes; the cooldown path never writes here.
@@ -219,6 +220,35 @@ actor ClaudeProvider: UsageProvider {
             resetsAt: date(object["resets_at"]),
             windowDuration: windowDuration
         ))
+    }
+
+    /// Model-scoped meters (e.g. the Fable weekly limit) don't get their own top-level window like
+    /// `seven_day_sonnet` — they only appear in the `limits` array as `weekly_scoped` entries. Map any
+    /// scoped weekly limit into a metric labeled by the model's display name, skipping labels the
+    /// top-level windows already covered.
+    private func appendScopedLimits(_ value: Any?, into metrics: inout [UsageMetric]) {
+        guard let limits = value as? [[String: Any]] else { return }
+        let existing = Set(metrics.map(\.label))
+        for limit in limits {
+            guard limit["group"] as? String == "weekly",
+                  let scope = limit["scope"] as? [String: Any],
+                  let model = scope["model"] as? [String: Any],
+                  let label = (model["display_name"] as? String)?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !label.isEmpty, !existing.contains(label),
+                  let percent = number(limit["percent"])
+            else {
+                continue
+            }
+            metrics.append(UsageMetric(
+                label: label,
+                used: percent,
+                limit: 100,
+                kind: .percent,
+                resetsAt: date(limit["resets_at"]),
+                windowDuration: 7 * 86400
+            ))
+        }
     }
 
     private func appendExtraUsage(_ value: Any?, into metrics: inout [UsageMetric]) {
